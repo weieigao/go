@@ -15,9 +15,11 @@ import (
 	"container/list"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http/httptrace"
@@ -30,6 +32,7 @@ import (
 
 	"golang_org/x/net/lex/httplex"
 	"golang_org/x/net/proxy"
+	"net/http/ntlm"
 )
 
 // DefaultTransport is the default implementation of Transport and is
@@ -575,6 +578,9 @@ var (
 	noProxyEnv = &envOnce{
 		names: []string{"NO_PROXY", "no_proxy"},
 	}
+	ntlmProxyEnv = &envOnce{
+		names: []string{"NTLM_PROXY", "ntlm_proxy"},
+	}
 )
 
 // envOnce looks up an environment variable (optionally by multiple
@@ -1096,36 +1102,54 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 				h.Set("Proxy-Authorization", pa)
 			}
 		}
+
+		if ntlmProxyEnv.Get() != "" {
+			conn := pconn.conn
+			err := ntlmAuth(t, cm, pconn.conn)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+
 	case cm.targetScheme == "https":
 		conn := pconn.conn
-		hdr := t.ProxyConnectHeader
-		if hdr == nil {
-			hdr = make(Header)
-		}
-		connectReq := &Request{
-			Method: "CONNECT",
-			URL:    &url.URL{Opaque: cm.targetAddr},
-			Host:   cm.targetAddr,
-			Header: hdr,
-		}
-		if pa := cm.proxyAuth(); pa != "" {
-			connectReq.Header.Set("Proxy-Authorization", pa)
-		}
-		connectReq.Write(conn)
+		if ntlmProxyEnv.Get() != "" {
+			err := ntlmAuth(t, cm, conn)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+		} else {
+			hdr := t.ProxyConnectHeader
+			if hdr == nil {
+				hdr = make(Header)
+			}
+			connectReq := &Request{
+				Method: "CONNECT",
+				URL:    &url.URL{Opaque: cm.targetAddr},
+				Host:   cm.targetAddr,
+				Header: hdr,
+			}
+			if pa := cm.proxyAuth(); pa != "" {
+				connectReq.Header.Set("Proxy-Authorization", pa)
+			}
+			connectReq.Write(conn)
 
-		// Read response.
-		// Okay to use and discard buffered reader here, because
-		// TLS server will not speak until spoken to.
-		br := bufio.NewReader(conn)
-		resp, err := ReadResponse(br, connectReq)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-		if resp.StatusCode != 200 {
-			f := strings.SplitN(resp.Status, " ", 2)
-			conn.Close()
-			return nil, errors.New(f[1])
+			// Read response.
+			// Okay to use and discard buffered reader here, because
+			// TLS server will not speak until spoken to.
+			br := bufio.NewReader(conn)
+			resp, err := ReadResponse(br, connectReq)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+			if resp.StatusCode != 200 {
+				f := strings.SplitN(resp.Status, " ", 2)
+				conn.Close()
+				return nil, errors.New(f[1])
+			}
 		}
 	}
 
@@ -1186,6 +1210,86 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 	go pconn.readLoop()
 	go pconn.writeLoop()
 	return pconn, nil
+}
+
+func ntlmAuth(t *Transport, cm connectMethod, conn net.Conn) error {
+	auth, authOk := ntlm.GetDefaultCredentialsAuth()
+	if !authOk {
+		return errors.New("Failed to get NTLM default credentials auth")
+	}
+
+	negotiateMessageBytes, err := auth.GetNegotiateBytes()
+	if err != nil {
+		return errors.New("Failed to get NTLM negotiation bytes")
+	}
+	defer auth.ReleaseContext()
+
+	negotiateMsg := base64.StdEncoding.EncodeToString(negotiateMessageBytes)
+
+	hdr := t.ProxyConnectHeader
+	if hdr == nil {
+		hdr = make(Header)
+	}
+	hdr.Set("Proxy-Connection", "Keep-Alive")
+	hdr.Set("Proxy-Authorization", "NTLM "+negotiateMsg)
+	connectReq := &Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: cm.targetAddr},
+		Host:   cm.targetAddr,
+		Header: hdr,
+	}
+
+	connectReq.Write(conn)
+
+	// Read response.
+	br := bufio.NewReader(conn)
+	resp, err := ReadResponse(br, connectReq)
+	if err != nil {
+		return err
+	}
+	_, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 407 {
+		f := strings.SplitN(resp.Status, " ", 2)
+		return errors.New(f[1])
+	}
+
+	// decode challenge
+	challengeMessage, err := ntlm.ParseChallengeResponse(resp.Header.Get("Proxy-Authenticate"))
+	if err != nil {
+		return err
+	}
+
+	challengeBytes, err := auth.GetResponseBytes(challengeMessage)
+	if err != nil {
+		return err
+	}
+
+	authMsg := base64.StdEncoding.EncodeToString(challengeBytes)
+	hdr.Set("Proxy-Authorization", "NTLM "+authMsg)
+	connectReq = &Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: cm.targetAddr},
+		Host:   cm.targetAddr,
+		Header: hdr,
+	}
+	connectReq.Write(conn)
+
+	// Read response.
+	resp, err = ReadResponse(br, connectReq)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		f := strings.SplitN(resp.Status, " ", 2)
+		return errors.New(f[1])
+	}
+
+	return nil
 }
 
 // persistConnWriter is the io.Writer written to by pc.bw.
